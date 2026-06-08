@@ -19,10 +19,13 @@ const UNIPILE_DSN = reqEnv("UNIPILE_DSN");
 const UNIPILE_API_KEY = reqEnv("UNIPILE_API_KEY");
 const UNIPILE_ACCOUNT_ID = reqEnv("UNIPILE_ACCOUNT_ID");
 
-const SEARCH_BODY = JSON.parse(
+// Aceita um objeto único OU uma lista de buscas. Cada item é o corpo de uma busca
+// (ex: {"url":"...savedSearchId=..."}). Todas rodam e os resultados são unidos.
+const SEARCH_INPUT = JSON.parse(
   process.env.SEARCH_BODY ??
     '{"api":"classic","category":"people","keywords":"teste"}'
 );
+const SEARCH_BODIES: any[] = Array.isArray(SEARCH_INPUT) ? SEARCH_INPUT : [SEARCH_INPUT];
 
 const PAGE_LIMIT = Number(process.env.PAGE_LIMIT ?? "10");
 const PAGE_DELAY_MS = Number(process.env.PAGE_DELAY_MS ?? "3000");
@@ -65,7 +68,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
 // ===================================================================
 // 1) Busca paginada (só URLs)
 // ===================================================================
-async function fetchAllPeople(): Promise<SearchPerson[]> {
+async function fetchSearch(body: any, label: string): Promise<SearchPerson[]> {
   const people: SearchPerson[] = [];
   let cursor: string | null = null;
   let page = 0;
@@ -84,9 +87,9 @@ async function fetchAllPeople(): Promise<SearchPerson[]> {
         accept: "application/json",
         "content-type": "application/json",
       },
-      body: JSON.stringify(SEARCH_BODY),
+      body: JSON.stringify(body),
     });
-    if (!res.ok) throw new Error(`Unipile search ${res.status} (pág ${page}): ${await res.text()}`);
+    if (!res.ok) throw new Error(`Unipile search ${res.status} (${label} pág ${page}): ${await res.text()}`);
 
     const data: any = await res.json();
     const items: any[] = data.items ?? data.results ?? [];
@@ -103,12 +106,22 @@ async function fetchAllPeople(): Promise<SearchPerson[]> {
     }
 
     cursor = data.cursor ?? null;
-    console.log(`Busca pág ${page}: ${items.length} itens | cursor=${cursor ? "..." : "null"}`);
+    console.log(`${label} pág ${page}: ${items.length} itens | cursor=${cursor ? "..." : "null"}`);
     if (cursor && page < MAX_PAGES) await sleep(PAGE_DELAY_MS);
   } while (cursor && page < MAX_PAGES);
 
-  console.log(`Busca total: ${people.length} pessoas com slug.`);
+  console.log(`${label}: ${people.length} pessoas com slug.`);
   return people;
+}
+
+async function fetchAllPeople(): Promise<SearchPerson[]> {
+  const bySlug = new Map<string, SearchPerson>();
+  for (let i = 0; i < SEARCH_BODIES.length; i++) {
+    const people = await fetchSearch(SEARCH_BODIES[i], `Busca ${i + 1}/${SEARCH_BODIES.length}`);
+    for (const p of people) if (!bySlug.has(p.slug)) bySlug.set(p.slug, p);
+  }
+  console.log(`Total único (todas as buscas): ${bySlug.size} pessoas com slug.`);
+  return [...bySlug.values()];
 }
 
 // ===================================================================
