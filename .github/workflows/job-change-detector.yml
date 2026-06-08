@@ -3,7 +3,12 @@ name: job-change-detector
 on:
   schedule:
     - cron: "17 9 * * *"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry-run (nao escreve no banco nem dispara webhook)"
+        type: boolean
+        default: true
 
 concurrency:
   group: job-change-detector
@@ -31,6 +36,7 @@ jobs:
           MAX_PAGES: "200"
           PROFILE_DELAY_MS: "4000"
           MAX_PROFILE_FETCHES: "120"
+          DRY_RUN: ${{ inputs.dry_run }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           CONTACTS_TABLE: active_campaign_linkedin
