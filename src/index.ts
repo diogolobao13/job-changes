@@ -1,25 +1,24 @@
 /**
  * Job-change detector
  * --------------------
- * 1. Pagina uma busca de pessoas na Unipile (só traz a URL do LinkedIn).
- * 2. Casa cada pessoa contra a base do Active (active_campaign_linkedin) pelo slug
- *    da URL. Quem NÃO está na base é ignorado (não gasta fetch de perfil).
- * 3. Pros que estão: 2ª request (retrieve profile) pra pegar a empresa atual.
- * 4. Compara com company_name salvo. Mudou -> webhook + update da linha + log.
+ * Active: usado SÓ pra resolver o contact_id (match pela URL). Nada mais vem dele.
+ * linkedin_job_changes: 1 linha por contato com a empresa atual do LinkedIn (a baseline).
  *
- * Roda como GitHub Action (cron). Limite do runner: 6h.
+ * Por contato que casa:
+ *   - busca a empresa atual no LinkedIn (retrieve profile);
+ *   - se o contato NÃO está na linkedin_job_changes -> INSERE (seed), sem webhook;
+ *   - se JÁ está e a empresa difere -> ATUALIZA a linha + dispara webhook.
+ *
+ * Primeira rodada insere todo mundo (baseline). Da segunda em diante, detecta mudanças.
  */
 
 import { createClient } from "@supabase/supabase-js";
 
-// ---------- Config (secrets/env do GitHub Action) ----------
-const UNIPILE_DSN = reqEnv("UNIPILE_DSN"); // ex: api27.unipile.com:15712
+// ---------- Config ----------
+const UNIPILE_DSN = reqEnv("UNIPILE_DSN");
 const UNIPILE_API_KEY = reqEnv("UNIPILE_API_KEY");
 const UNIPILE_ACCOUNT_ID = reqEnv("UNIPILE_ACCOUNT_ID");
 
-// Corpo exato da busca (cole o JSON que já funciona). Ex (classic):
-//   {"api":"classic","category":"people","keywords":"teste"}
-// Sales Navigator: {"api":"sales_navigator","category":"people", ...seus filtros}
 const SEARCH_BODY = JSON.parse(
   process.env.SEARCH_BODY ??
     '{"api":"classic","category":"people","keywords":"teste"}'
@@ -29,45 +28,34 @@ const PAGE_LIMIT = Number(process.env.PAGE_LIMIT ?? "10");
 const PAGE_DELAY_MS = Number(process.env.PAGE_DELAY_MS ?? "3000");
 const MAX_PAGES = Number(process.env.MAX_PAGES ?? "200");
 
-// Recuperação de perfil é o recurso caro (limite ~150/dia em SN). Pace + teto.
 const PROFILE_DELAY_MS = Number(process.env.PROFILE_DELAY_MS ?? "4000");
 const MAX_PROFILE_FETCHES = Number(process.env.MAX_PROFILE_FETCHES ?? "120");
 
 const SUPABASE_URL = reqEnv("SUPABASE_URL");
 const SUPABASE_SERVICE_ROLE_KEY = reqEnv("SUPABASE_SERVICE_ROLE_KEY");
-const CONTACTS_TABLE = process.env.CONTACTS_TABLE ?? "active_campaign_linkedin";
-const CHANGES_TABLE = process.env.CHANGES_TABLE ?? "linkedin_job_changes";
+const ACTIVE_TABLE = process.env.CONTACTS_TABLE ?? "active_campaign_linkedin";
+const STATE_TABLE = process.env.CHANGES_TABLE ?? "linkedin_job_changes";
 
 const WEBHOOK_URL =
   process.env.WEBHOOK_URL ?? "https://webhook.slcomm.xyz/webhook/mudanca-de-empresa";
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET ?? "";
 
-// Modo teste: faz leitura (busca/match/perfil) mas NÃO escreve no banco nem dispara webhook.
+// Teste: lê tudo mas NÃO escreve no banco nem dispara webhook.
 const DRY_RUN = (process.env.DRY_RUN ?? "false").toLowerCase() === "true";
 
 // ---------- Tipos ----------
 type SearchPerson = {
-  linkedin_url: string;
-  slug: string; // identificador público extraído da URL (/in/<slug>)
-  provider_id: string | null;
-  full_name: string | null;
-};
-
-type Contact = {
-  id: number;
-  contact_id: number;
-  linkedin_url: string | null;
-  company_name: string | null;
-  uuid_linkedin: string | null;
   slug: string;
+  linkedin_url: string;
+  full_name: string | null;
 };
 
-type ChangeEvent = {
+type StateRow = {
   contact_id: number;
   linkedin_url: string | null;
   full_name: string | null;
-  company: string; // empresa atual (vinda do fetch da Unipile)
-  detected_at: string;
+  company: string;
+  updated_at: string;
 };
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
@@ -106,16 +94,15 @@ async function fetchAllPeople(): Promise<SearchPerson[]> {
       const linkedin_url =
         item.public_profile_url ?? item.profile_url ?? item.public_url ?? item.url ?? null;
       const slug = slugFromUrl(linkedin_url) ?? slugFromUrl(item.public_identifier);
-      if (!slug) continue; // sem slug não dá pra casar
+      if (!slug) continue;
       people.push({
-        linkedin_url: linkedin_url ?? `https://www.linkedin.com/in/${slug}`,
         slug,
-        provider_id: item.id ?? item.provider_id ?? item.member_urn ?? null,
+        linkedin_url: linkedin_url ?? `https://www.linkedin.com/in/${slug}`,
         full_name: item.name ?? item.full_name ?? null,
       });
     }
 
-    cursor = data.cursor ?? null; // null = fim (padrão Unipile)
+    cursor = data.cursor ?? null;
     console.log(`Busca pág ${page}: ${items.length} itens | cursor=${cursor ? "..." : "null"}`);
     if (cursor && page < MAX_PAGES) await sleep(PAGE_DELAY_MS);
   } while (cursor && page < MAX_PAGES);
@@ -125,24 +112,24 @@ async function fetchAllPeople(): Promise<SearchPerson[]> {
 }
 
 // ===================================================================
-// 2) Carrega o Active e indexa por slug (match por "contains" via slug)
+// 2) Do Active, SÓ o contact_id (mapeado por slug da URL)
 // ===================================================================
-async function loadContactsBySlug(): Promise<Map<string, Contact>> {
-  const map = new Map<string, Contact>();
+async function loadContactIdBySlug(): Promise<Map<string, number>> {
+  const map = new Map<string, number>();
   const PAGE = 1000;
   let from = 0;
   for (;;) {
     const { data, error } = await supabase
-      .from(CONTACTS_TABLE)
-      .select("id, contact_id, linkedin_url, company_name, uuid_linkedin")
+      .from(ACTIVE_TABLE)
+      .select("contact_id, linkedin_url")
       .not("linkedin_url", "is", null)
       .range(from, from + PAGE - 1);
-    if (error) throw new Error(`Supabase select contatos: ${error.message}`);
+    if (error) throw new Error(`Supabase select Active: ${error.message}`);
     if (!data || data.length === 0) break;
 
     for (const row of data) {
       const slug = slugFromUrl(row.linkedin_url);
-      if (slug) map.set(slug, { ...(row as any), slug });
+      if (slug && row.contact_id != null) map.set(slug, row.contact_id);
     }
     if (data.length < PAGE) break;
     from += PAGE;
@@ -152,7 +139,32 @@ async function loadContactsBySlug(): Promise<Map<string, Contact>> {
 }
 
 // ===================================================================
-// 3) Retrieve profile (2ª request) -> empresa atual
+// 3) Snapshot atual (empresa salva por contato) da linkedin_job_changes
+// ===================================================================
+async function loadSnapshot(): Promise<Map<number, string>> {
+  const map = new Map<number, string>();
+  const PAGE = 1000;
+  let from = 0;
+  for (;;) {
+    const { data, error } = await supabase
+      .from(STATE_TABLE)
+      .select("contact_id, company")
+      .range(from, from + PAGE - 1);
+    if (error) throw new Error(`Supabase select ${STATE_TABLE}: ${error.message}`);
+    if (!data || data.length === 0) break;
+
+    for (const row of data) {
+      if (row.contact_id != null && row.company) map.set(row.contact_id, row.company);
+    }
+    if (data.length < PAGE) break;
+    from += PAGE;
+  }
+  console.log(`Snapshot carregado: ${map.size} contatos já com empresa salva.`);
+  return map;
+}
+
+// ===================================================================
+// 4) Retrieve profile -> empresa atual
 // ===================================================================
 async function fetchCurrentCompany(slug: string): Promise<string | null> {
   const url = new URL(`https://${UNIPILE_DSN}/api/v1/users/${encodeURIComponent(slug)}`);
@@ -195,114 +207,111 @@ async function run() {
   const people = await fetchAllPeople();
   if (people.length === 0) return console.log("Busca vazia. Encerrando.");
 
-  const contacts = await loadContactsBySlug();
+  const contactIdBySlug = await loadContactIdBySlug();
+  const snapshot = await loadSnapshot();
 
-  // Mantém só quem está no Active, deduplicando por slug.
+  // Só quem está no Active, dedup por slug.
   const matched = new Map<string, SearchPerson>();
-  for (const p of people) if (contacts.has(p.slug)) matched.set(p.slug, p);
-  console.log(`Match no Active: ${matched.size}.`);
-  if (matched.size === 0) return;
+  for (const p of people) if (contactIdBySlug.has(p.slug)) matched.set(p.slug, p);
 
-  const changes: ChangeEvent[] = [];
+  // Prioriza quem ainda não tem baseline (pra semear primeiro dentro do teto de perfis/dia).
+  const list = [...matched.values()].sort((a, b) => {
+    const aSeeded = snapshot.has(contactIdBySlug.get(a.slug)!) ? 1 : 0;
+    const bSeeded = snapshot.has(contactIdBySlug.get(b.slug)!) ? 1 : 0;
+    return aSeeded - bSeeded;
+  });
+  console.log(`Match no Active: ${list.length}.`);
+  if (list.length === 0) return;
+
   const now = new Date().toISOString();
-  const today = now.slice(0, 10);
+  const toUpsert: StateRow[] = []; // seeds + mudanças
+  const changes: StateRow[] = []; // só mudanças -> webhook
   let fetches = 0;
+  let seeds = 0;
 
-  for (const [slug, person] of matched) {
+  for (const person of list) {
     if (fetches >= MAX_PROFILE_FETCHES) {
-      console.warn(`Teto de ${MAX_PROFILE_FETCHES} perfis/dia atingido. Resto fica pra amanhã.`);
+      console.warn(`Teto de ${MAX_PROFILE_FETCHES} perfis atingido. Resto fica pra próxima rodada.`);
       break;
     }
     fetches++;
-    const newCompany = await fetchCurrentCompany(slug);
+    const contactId = contactIdBySlug.get(person.slug)!;
+    const stored = snapshot.get(contactId); // undefined = ainda não semeado
+    const newCompany = await fetchCurrentCompany(person.slug);
     await sleep(PROFILE_DELAY_MS);
+
+    console.log(
+      `[match] ${person.slug} (contato ${contactId}): banco="${stored ?? "(novo)"}" unipile="${newCompany ?? "(null)"}"`
+    );
     if (!newCompany) continue;
 
-    const contact = contacts.get(slug)!;
-    const oldCompany = (contact.company_name ?? "").trim();
-
-    const changed = oldCompany && !sameCompany(oldCompany, newCompany);
-
-    // Atualiza a linha do Active (enriquece sempre; sinaliza empresa nova).
-    const patch: Record<string, any> = {
-      company_name: newCompany,
-      last_update_date: today,
+    const row: StateRow = {
+      contact_id: contactId,
+      linkedin_url: person.linkedin_url,
+      full_name: person.full_name,
+      company: newCompany,
       updated_at: now,
     };
-    if (!contact.uuid_linkedin && person.provider_id) patch.uuid_linkedin = person.provider_id;
 
-    if (DRY_RUN) {
-      console.log(
-        `[dry-run] update contato ${contact.contact_id}: "${oldCompany || "(vazio)"}" -> "${newCompany}"${changed ? "  *** MUDOU ***" : ""}`
-      );
-    } else {
-      const { error: upErr } = await supabase
-        .from(CONTACTS_TABLE)
-        .update(patch)
-        .eq("contact_id", contact.contact_id);
-      if (upErr) console.error(`Update contato ${contact.contact_id}: ${upErr.message}`);
+    if (stored === undefined) {
+      // Baseline: insere, sem webhook.
+      toUpsert.push(row);
+      seeds++;
+    } else if (!sameCompany(stored, newCompany)) {
+      // Mudou: atualiza + webhook.
+      toUpsert.push(row);
+      changes.push(row);
     }
-
-    if (changed) {
-      changes.push({
-        contact_id: contact.contact_id,
-        linkedin_url: person.linkedin_url,
-        full_name: person.full_name,
-        company: newCompany,
-        detected_at: now,
-      });
-    }
+    // mesma empresa -> nada
   }
 
-  console.log(`Mudanças de empresa: ${changes.length} (perfis consultados: ${fetches}).`);
+  console.log(`Novos (seed): ${seeds} | Mudanças: ${changes.length} | perfis consultados: ${fetches}.`);
 
-  if (changes.length > 0) {
-    if (DRY_RUN) {
-      console.log(`[dry-run] gravaria ${changes.length} em ${CHANGES_TABLE} e dispararia ${changes.length} webhook(s):`);
-      for (const c of changes) console.log(`  -> ${c.full_name} (${c.contact_id}): ${c.company}`);
-    } else {
-      // Registra na linkedin_job_changes (apenas a empresa atual)
-      const { error: logErr } = await supabase.from(CHANGES_TABLE).insert(
-        changes.map((c) => ({
-          contact_id: c.contact_id,
-          linkedin_url: c.linkedin_url,
-          full_name: c.full_name,
-          company: c.company,
-          detected_at: c.detected_at,
-        }))
-      );
-      if (logErr) console.error(`Insert ${CHANGES_TABLE}: ${logErr.message}`);
-
-      // Webhook: uma chamada por mudança
-      for (const c of changes) await sendWebhook(c);
-    }
+  if (DRY_RUN) {
+    console.log("[dry-run] não escreve no banco nem dispara webhook.");
+    for (const c of changes) console.log(`[dry-run] mudança contato ${c.contact_id} -> ${c.company}`);
+    return;
   }
+
+  if (toUpsert.length > 0) {
+    const { error } = await supabase
+      .from(STATE_TABLE)
+      .upsert(toUpsert, { onConflict: "contact_id" });
+    if (error) console.error(`Upsert ${STATE_TABLE}: ${error.message}`);
+    else console.log(`Gravados na ${STATE_TABLE}: ${toUpsert.length} (sendo ${seeds} novos).`);
+  }
+
+  for (const c of changes) await sendWebhook(c);
 }
 
-async function sendWebhook(change: ChangeEvent) {
+async function sendWebhook(c: StateRow) {
   const res = await fetch(WEBHOOK_URL, {
     method: "POST",
     headers: {
       "content-type": "application/json",
       ...(WEBHOOK_SECRET ? { "x-webhook-secret": WEBHOOK_SECRET } : {}),
     },
-    body: JSON.stringify(change),
+    body: JSON.stringify({
+      contact_id: c.contact_id,
+      linkedin_url: c.linkedin_url,
+      full_name: c.full_name,
+      company: c.company,
+      detected_at: c.updated_at,
+    }),
   });
   if (!res.ok) {
-    console.error(`Webhook ${res.status} (contato ${change.contact_id}): ${await res.text()}`);
+    console.error(`Webhook ${res.status} (contato ${c.contact_id}): ${await res.text()}`);
     return;
   }
-  console.log(`Webhook ok: contato ${change.contact_id} -> ${change.company}`);
+  console.log(`Webhook ok: contato ${c.contact_id} -> ${c.company}`);
 }
 
 // ---------- helpers ----------
 function slugFromUrl(value: string | null | undefined): string | null {
   if (!value) return null;
-  // já é um slug puro?
   if (!value.includes("/") && !value.includes(".")) return value.toLowerCase().trim();
   const m = value.match(/\/in\/([^/?#]+)/i);
   if (m) return decodeURIComponent(m[1]).toLowerCase().trim();
-  // fallback: último segmento da URL
   const clean = value.split("?")[0].replace(/\/+$/, "");
   const last = clean.split("/").pop();
   return last ? last.toLowerCase().trim() : null;
