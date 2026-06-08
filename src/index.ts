@@ -169,6 +169,7 @@ async function loadSnapshot(): Promise<Map<number, string>> {
 async function fetchCurrentCompany(slug: string): Promise<string | null> {
   const url = new URL(`https://${UNIPILE_DSN}/api/v1/users/${encodeURIComponent(slug)}`);
   url.searchParams.set("account_id", UNIPILE_ACCOUNT_ID);
+  url.searchParams.set("linkedin_sections", "*"); // necessário p/ trazer experiência/empresa
 
   const res = await fetch(url.toString(), {
     method: "GET",
@@ -178,7 +179,10 @@ async function fetchCurrentCompany(slug: string): Promise<string | null> {
     console.warn(`Perfil ${slug}: ${res.status} — pulando. ${await res.text()}`);
     return null;
   }
-  return extractCurrentCompany(await res.json());
+  const json = await res.json();
+  const company = extractCurrentCompany(json);
+  if (!company) console.log(`[raw ${slug}]`, JSON.stringify(json).slice(0, 1500));
+  return company;
 }
 
 // AJUSTE conforme o payload real do retrieve profile da Unipile.
